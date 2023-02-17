@@ -1,10 +1,13 @@
 import cv2
 import numpy as np
 import tensorflow as tf
-import pandas as pd
-from tensorflow.keras.applications import vgg16
-from sklearn.model_selection import train_test_split
+from tensorflow import keras
+from tensorflow.keras import layers
 
+import matplotlib.pyplot as plt
+
+from functools import partial
+from tqdm import tqdm
 import os
 from random import shuffle
 from glob import glob
@@ -15,10 +18,10 @@ IMG_SIZE = (224, 224)  # Size of images
 def load_image(path, target_size=IMG_SIZE):
     img = cv2.imread(path)[...,::-1]
     img = cv2.resize(img, target_size)
-    return vgg16.preprocess_input(img)  # Preprocess for vgg16
+    return img #vgg16.preprocess_input(img)  # Preprocess for vgg16
 
-# функция-генератор загрузки обучающих данных с диска
-def fit_generator(files, batch_size=128):
+# Training generator for inputs images
+def fit_generator(files, batch_size=32):
     batch_size = min(batch_size, len(files))
     while True:
         shuffle(files)
@@ -32,52 +35,96 @@ def fit_generator(files, batch_size=128):
                           for path in files[i:j]])
             yield (x, y)
 
-# функция-генератор загрузки тестовых изображений с диска
+# Testing generator for inputs images
 def predict_generator(files):
-    while True:
-        for path in files:
-            yield np.array([load_image(path)])
+    for path in tqdm(files):
+        yield np.array([load_image(path)])
             
 train_imgs = glob('data/train/*.jpg')
 test_imgs = glob('data/test/*.jpg')
-          
-# base_model - объект класса keras.models.Model (Functional Model)
-base_model = vgg16.VGG16(weights='imagenet',
-                         include_top=False,
-                         input_shape=(IMG_SIZE[0], IMG_SIZE[1], 3))
 
+data_augmentation = keras.Sequential(
+    [
+     layers.RandomFlip("horizontal"),
+     layers.RandomRotation(0.1),
+     layers.RandomZoom(0.2)
+     ]
+)
 
-# фиксируем все веса предобученной сети
-for layer in base_model.layers:
-    layer.trainable = False
+shuffle(train_imgs)
+batch_size = 48
+train_generator = partial(fit_generator, files=train_imgs, batch_size=batch_size)
 
-x = base_model.layers[-5].output
-x = tf.keras.layers.Flatten()(x)
-x = tf.keras.layers.Dense(1,  # один выход (бинарная классификация)
-                          activation='sigmoid',  # функция активации  
-                          kernel_regularizer=tf.keras.regularizers.l1(1e-4))(x)
-
-model = tf.keras.Model(inputs=base_model.input, outputs=x, name='dogs_vs_cats')
-
-model.compile(optimizer='adam', 
-              loss='binary_crossentropy',  # функция потерь binary_crossentropy (log loss
-              metrics=['accuracy'])
+train_dataset = tf.data.Dataset.from_generator(
+                    train_generator,
+                    output_signature=(
+                             tf.TensorSpec(shape=(batch_size, 224,224,3), dtype=tf.uint8),
+                             tf.TensorSpec(shape=(batch_size,), dtype=tf.float64)
+                             )
+                    )
 
 val_samples = 5  # число изображений в валидационной выборке
-
-shuffle(train_imgs)  # перемешиваем обучающую выборку
 validation_data = next(fit_generator(train_imgs[:val_samples], val_samples))
-train_data = fit_generator(train_imgs[val_samples:])  # данные читаем функцией-генератором
+
+plt.figure(figsize=(10,10))
+for images, _ in train_dataset.take(1):
+    for i in range(9):
+        aug_imgs = data_augmentation(images)
+        ax = plt.subplot(3,3,i+1)
+        plt.imshow(aug_imgs[0].numpy().astype("uint8"))
+        plt.axis("off")
+
+#conv_base = keras.applications.vgg16.VGG16(
+#    weights="imagenet",
+#    include_top=False)
+#conv_base.trainable = False
+#conv_base.summary()
+       
+inputs = keras.Input(shape=(224,224,3))
+x = data_augmentation(inputs)
+#x = keras.applications.vgg16.preprocess_input(x)
+#x = conv_base(x)
+#x = layers.Flatten()(x)
+#x = layers.Dense(256)(x)
+x = layers.Rescaling(1./255)(x)
+x = layers.Conv2D(filters=32, kernel_size=3, activation="relu")(x)
+x = layers.MaxPooling2D(pool_size=2)(x)
+x = layers.Conv2D(filters=64, kernel_size=3, activation="relu")(x)
+x = layers.MaxPooling2D(pool_size=2)(x)
+x = layers.Conv2D(filters=128, kernel_size=3, activation="relu")(x)
+x = layers.MaxPooling2D(pool_size=2)(x)
+x = layers.Conv2D(filters=256, kernel_size=3, activation="relu")(x)
+x = layers.MaxPooling2D(pool_size=2)(x)
+x = layers.Conv2D(filters=256, kernel_size=3, activation="relu")(x)
+x = layers.Flatten()(x)
+x = layers.Dropout(0.5)(x)
+outputs = layers.Dense(1, activation="sigmoid")(x)
+
+model = keras.Model(inputs=inputs, outputs=outputs)
+model.compile(loss="binary_crossentropy",
+              optimizer="rmsprop",
+              metrics=["accuracy"])
+
+model.summary()
+
+
+callbacks = [
+    keras.callbacks.ModelCheckpoint(
+        filepath="vgg16.keras",
+        save_best_only=True,
+        monitor="val_loss"
+        )]
+
 
 # запускаем процесс обучения
-model.fit(train_data,
-          steps_per_epoch=10,  # число вызовов генератора за эпоху
-          epochs=100,  # число эпох обучения
-          validation_data=validation_data)
+history = model.fit(train_dataset,
+              steps_per_epoch=25,  # число вызовов генератора за эпоху
+              epochs=100,  # число эпох обучения
+              validation_data=validation_data,
+              callbacks=callbacks)
+
 
 test_pred = model.predict(predict_generator(test_imgs))
-
-
     
 import re
 
